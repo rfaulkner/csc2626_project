@@ -203,12 +203,20 @@ def main():
     p.add_argument("--text_mode", choices=["clip", "hash"], default="clip")
     p.add_argument("--sim_backend", default="physx_cpu")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--skip_existing", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
     set_seed(args.seed)
     demos_path = args.demos or f"data/demos_{args.task}_{args.variant}.pt"
     out_dir = args.out_dir or f"checkpoints/{args.task}_{args.variant}_seed{args.seed}"
+    if (
+        args.skip_existing
+        and os.path.exists(os.path.join(out_dir, "bc_ckpt.pt"))
+        and os.path.exists(os.path.join(out_dir, "thresholds.json"))
+    ):
+        print(f"Skipping existing BC checkpoint: {out_dir}")
+        return
     os.makedirs(out_dir, exist_ok=True)
 
     raw = torch.load(demos_path, map_location="cpu", weights_only=True)

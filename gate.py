@@ -20,6 +20,7 @@ class GateThresholds:
     tau_l: float
     quantile_h: float = 0.85
     quantile_l: float = 0.85
+    fire_rate: float = 0.20
 
     def query_high(self, u_h: float) -> bool:
         return u_h > self.tau_h
@@ -59,7 +60,7 @@ def calibrate_thresholds(
         prev_z = NONE_SUBGOAL
         active_z: str | None = None
         steps = 0
-        max_steps = env.spec.max_episode_steps or 180
+        max_steps = env.spec.max_episode_steps or 220
 
         while steps < max_steps:
             if active_z is not None and u.is_subgoal_achieved(active_z):
@@ -86,6 +87,15 @@ def calibrate_thresholds(
 
     tau_h = float(np.quantile(u_h_scores, quantile_h)) if u_h_scores else 0.5
     tau_l = float(np.quantile(u_l_scores, quantile_l)) if u_l_scores else 0.5
+    fire_rate = (
+        float(np.mean([(uh > tau_h) or (ul > tau_l) for uh, ul in zip(u_h_scores, u_l_scores)]))
+        if u_h_scores
+        else 0.20
+    )
     return GateThresholds(
-        tau_h=tau_h, tau_l=tau_l, quantile_h=quantile_h, quantile_l=quantile_l
+        tau_h=tau_h,
+        tau_l=tau_l,
+        quantile_h=quantile_h,
+        quantile_l=quantile_l,
+        fire_rate=round(fire_rate, 4),
     )

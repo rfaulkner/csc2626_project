@@ -12,7 +12,7 @@
 #SBATCH --mem=32G
 
 # Weeks 1-2: Collect N=50 expert demos, train initial BC policies (pi_h, pi_l)
-# across seeds, check per-subgoal competence, and calibrate (tau_h, tau_l).
+# across 5 seeds, check per-subgoal competence, and calibrate (tau_h, tau_l).
 
 set -euo pipefail
 
@@ -50,5 +50,6 @@ for seed in ${SEEDS}; do
     --variant "${VARIANT}" \
     --demos "${demos_file}" \
     --out_dir "checkpoints/${TASK}_${VARIANT}_seed${seed}" \
+    --skip_existing \
     --seed "${seed}"
 done

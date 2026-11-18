@@ -226,12 +226,18 @@ def main():
     p.add_argument("--episodes_per_round", type=int, default=20)
     p.add_argument("--eval_episodes", type=int, default=100)
     p.add_argument("--k_max", type=int, default=45)
-    p.add_argument("--random_prob", type=float, default=0.15)
+    p.add_argument(
+        "--random_prob",
+        type=float,
+        default=-1.0,
+        help="Random gate firing prob; <0 uses calibrated gate.fire_rate.",
+    )
     p.add_argument("--oracle_noise", type=float, default=0.0)
     p.add_argument("--steps_h", type=int, default=1500)
     p.add_argument("--steps_l", type=int, default=3000)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--cf_samples_per_round", type=int, default=15)
+    p.add_argument("--skip_existing", action="store_true")
     p.add_argument("--demos", default=None)
     p.add_argument("--bc_dir", default=None)
     p.add_argument("--out_dir", default=None)
@@ -248,6 +254,12 @@ def main():
     out_dir = args.out_dir or (
         f"results/{args.task}_{args.variant}/{args.channel}_lam{args.lam:g}_B{args.budget:g}/seed{args.seed}"
     )
+    csv_path = os.path.join(out_dir, "metrics.csv")
+    if args.skip_existing and os.path.exists(csv_path):
+        with open(csv_path, "r", encoding="utf-8") as f:
+            if sum(1 for _ in csv.DictReader(f)) >= args.rounds + 1:
+                print(f"Skipping completed run: {csv_path}")
+                return
     os.makedirs(out_dir, exist_ok=True)
 
     raw = torch.load(demos_path, map_location="cpu", weights_only=True)
@@ -258,6 +270,7 @@ def main():
         device=args.device,
     )
     gate = GateThresholds.load(os.path.join(bc_dir, "thresholds.json"))
+    random_prob = gate.fire_rate if args.random_prob < 0.0 else args.random_prob
 
     env = make_env(args.task, variant=args.variant, sim_backend=args.sim_backend)
     cf_env = (
@@ -269,8 +282,6 @@ def main():
         agent.vocab, noise_p=args.oracle_noise, seed=args.seed + 77
     )
     act_expert = ScriptedPickPlaceExpert()
-
-    csv_path = os.path.join(out_dir, "metrics.csv")
     fields = [
         "task",
         "variant",
@@ -330,7 +341,7 @@ def main():
                 round_budget=round_share,
                 lam=args.lam,
                 k_max=args.k_max,
-                random_prob=args.random_prob,
+                random_prob=random_prob,
                 seed_base=30000 + args.seed * 1000 + r * 100,
                 episodes=args.episodes_per_round,
                 cf_limit=args.cf_samples_per_round,
