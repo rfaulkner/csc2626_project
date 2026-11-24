@@ -143,10 +143,15 @@ class _MultiCubeBaseEnv(BaseEnv):
             return
         if self._push_rng.rand() >= self.push_prob:
             return
+        binned = (
+            {c for c, b in self.pairs if self._is_in_bin(c, b)}
+            if hasattr(self, "pairs") and hasattr(self, "_is_in_bin")
+            else set()
+        )
         poses = {c: self.cubes[c].pose.p[0] for c in COLORS[:3]}
         candidates = []
         for c, p in poses.items():
-            if bool(self.agent.is_grasping(self.cubes[c])[0].item()):
+            if c in binned or bool(self.agent.is_grasping(self.cubes[c])[0].item()):
                 continue
             if p[2].item() > self.half_size_val + 0.006:
                 continue
@@ -337,8 +342,30 @@ class ColorSortEnv(_MultiCubeBaseEnv):
 
     def __init__(self, *args, **kwargs):
         self.pairs: list[tuple[str, str]] = [("red", "red"), ("green", "green")]
-        self.bin_tol = 0.026 if kwargs.get("variant") == "exec" else 0.036
+        is_exec = kwargs.get("variant") == "exec"
+        self.bin_tol = 0.0135 if is_exec else 0.036
+        self.act_noise = 0.048 if is_exec else 0.0
         super().__init__(*args, **kwargs)
+        if self.is_exec:
+            self.push_prob = 0.045
+            self.push_vel = 0.075
+
+    def step(self, action):
+        if self.is_exec and action is not None and self.act_noise > 0.0:
+            noise = self._push_rng.normal(0.0, self.act_noise, size=3).astype(np.float32)
+            if isinstance(action, torch.Tensor):
+                action = action.clone()
+                action[..., :3] = torch.clamp(
+                    action[..., :3] + torch.from_numpy(noise).to(action.device), -1.0, 1.0
+                )
+            else:
+                a = np.asarray(action, dtype=np.float32).copy()
+                if a.ndim == 1:
+                    a[:3] = np.clip(a[:3] + noise, -1.0, 1.0)
+                else:
+                    a[:, :3] = np.clip(a[:, :3] + noise[None, :], -1.0, 1.0)
+                action = a
+        return super().step(action)
 
     def _load_scene(self, options: dict):
         del options
@@ -368,7 +395,7 @@ class ColorSortEnv(_MultiCubeBaseEnv):
             if self.is_exec:
                 self.pairs = [("red", "red"), ("green", "green")]
                 self._sample_cube_poses(
-                    b, (-0.14, 0.02), (-0.20, 0.20), COLORS[:3]
+                    b, (-0.22, 0.02), (-0.25, 0.25), COLORS[:3]
                 )
             else:
                 cubes = rng.choice(COLORS, size=2, replace=False)
