@@ -1,6 +1,6 @@
 #!/bin/bash
-# One-shot environment setup for CSC2626 project (local or Compute Canada / Killarney).
-# Run on a LOGIN node (needs internet to install wheels and warm asset/CLIP caches):
+# One-shot environment setup for CSC2626 project (Compute Canada / Killarney or local).
+# Run on a LOGIN node (needs internet for PyPI wheels + asset/CLIP cache warmup):
 #   bash setup.sh [--keep-venv] && source .venv/bin/activate
 
 set -euo pipefail
@@ -19,11 +19,14 @@ for arg in "$@"; do
   esac
 done
 
+log() { printf '\n=== %s ===\n' "$*"; }
+
 if [[ -n "${VIRTUAL_ENV:-}" ]]; then
   deactivate 2>/dev/null || true
   unset VIRTUAL_ENV
 fi
 
+log "[1/5] Loading cluster modules"
 if command -v module >/dev/null 2>&1; then
   set +u
   module load StdEnv/2023 "python/${PY_VER}" cuda/12.2 2>/dev/null \
@@ -31,6 +34,7 @@ if command -v module >/dev/null 2>&1; then
   set -u
 fi
 
+log "[2/5] Creating virtual environment at ${VENV_DIR}"
 py_bin="$(command -v "python${PY_VER}" || command -v python3)"
 [[ -d "${VENV_DIR}" && "${keep_venv}" -eq 0 ]] && rm -rf "${VENV_DIR}"
 if [[ ! -d "${VENV_DIR}" ]]; then
@@ -56,38 +60,57 @@ fi
 
 # shellcheck disable=SC1090
 source "${activate_file}"
-pip install -q --upgrade pip
+pip install --no-index --upgrade pip 2>/dev/null || pip install --upgrade pip
+site_pkgs="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 
 work_dir="$(mktemp -d)"
 trap 'rm -rf "${work_dir}"' EXIT
 
-# Retag manylinux wheels for Compute Canada wheelhouse compatibility when needed.
-install_pypi_wheel() {
-  local spec="$1"
-  local whl
-  PIP_CONFIG_FILE=/dev/null pip download -q --isolated --only-binary=:all: \
-    --platform manylinux_2_28_x86_64 --platform manylinux_2_17_x86_64 \
+if [[ "${keep_venv}" -eq 1 ]] && python -c "import mani_skill, sapien, torch, transformers" 2>/dev/null; then
+  log "[3-4/5] Reusing existing packages in ${VENV_DIR} (--keep-venv)"
+else
+  # Stage A: Install core scientific/ML stack from local Compute Canada wheelhouse
+  # (--no-index avoids hitting PyPI or compiling C++/Rust sdists for torch/transformers).
+  log "[3/5] Installing core ML stack (local wheelhouse first)"
+  readonly CORE_PKGS=(
+    "numpy>=1.24,<2" scipy matplotlib torch "transformers<5" huggingface_hub
+    "gymnasium>=0.29.1" lxml h5py pyyaml tqdm requests defusedxml imageio
+    GitPython tabulate ipython absl-py "typing-extensions>=4.12"
+  )
+  if ! pip install --no-index "${CORE_PKGS[@]}"; then
+    echo "Local wheelhouse incomplete; installing core stack with binary wheels..."
+    for pkg in "${CORE_PKGS[@]}"; do
+      pip install --no-index "${pkg}" 2>/dev/null || pip install --prefer-binary "${pkg}"
+    done
+  fi
+
+  # Stage B: Download remaining wheels directly from PyPI (--only-binary=:all: so
+  # pip NEVER compiles sdists) and retag manylinux wheels for Compute Canada.
+  log "[4/5] Installing ManiSkill3, SAPIEN, and pure-Python robotics wheels"
+  PIP_CONFIG_FILE=/dev/null pip download --isolated --only-binary=:all: \
+    --platform manylinux_2_28_x86_64 --platform manylinux_2_17_x86_64 --platform any \
     --python-version "${PY_TAG}" --implementation cp --abi "cp${PY_TAG}" \
-    --no-deps -d "${work_dir}" "${spec}"
-  whl="$(ls "${work_dir}"/*.whl | head -n 1)"
-  mv "${whl}" "${whl%-*}-linux_x86_64.whl"
-  pip install -q --no-deps "${whl%-*}-linux_x86_64.whl"
-  rm -f "${work_dir}"/*.whl
-}
+    --no-deps -d "${work_dir}" \
+    "sapien==3.0.3" "opencv-python-headless<4.12" "mani-skill==3.0.1" \
+    pytorch_kinematics_ms pytorch-seed arm-pytorch-utilities \
+    transforms3d trimesh dacite "tyro>=0.8.5" docstring-parser typeguard nvidia-ml-py
 
-if ! pip install -q --no-deps sapien==3.0.3 2>/dev/null; then
-  install_pypi_wheel "sapien==3.0.3"
+  for whl in "${work_dir}"/*manylinux*.whl; do
+    [[ -e "${whl}" ]] || continue
+    mv "${whl}" "${whl%-*}-linux_x86_64.whl"
+  done
+  pip install --no-index --no-deps "${work_dir}"/*.whl
+
+  if command -v setrpaths.sh >/dev/null 2>&1; then
+    for d in "${site_pkgs}/sapien" "${site_pkgs}/cv2" "${site_pkgs}/opencv_python_headless.libs"; do
+      [[ -d "${d}" ]] && setrpaths.sh --path "${d}" --add_origin --add_path "${d}" || true
+    done
+  fi
 fi
-if ! pip install -q --no-deps "opencv-python-headless<4.12" 2>/dev/null; then
-  install_pypi_wheel "opencv-python-headless<4.12"
-fi
 
-grep -viE '^(sapien|mani-skill|opencv-python)' requirements.txt > "${work_dir}/reqs.txt"
-pip install -q -r "${work_dir}/reqs.txt" --prefer-binary
-pip install -q --no-deps mani-skill==3.0.1
-
-echo "=== Warming ManiSkill3 & CLIP caches for offline compute nodes ==="
-export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
+log "[5/5] Warming ManiSkill3 & CLIP caches for offline compute nodes"
+export HF_HOME="${HF_HOME:-/scratch/${USER}/hf_cache}"
+mkdir -p "${HF_HOME}"
 python - <<'EOF'
 from envs import COLORS, BIN_COLORS, STACK_VOCAB, SORT_VOCAB, make_env
 from models import TextEncoder

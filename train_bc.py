@@ -27,16 +27,23 @@ def train_on_datasets(
     agent: HierarchicalAgent,
     dh: dict,
     dl: dict,
-    steps_h: int = 1500,
-    steps_l: int = 3000,
-    batch_size: int = 128,
+    steps_h: int = 2000,
+    steps_l: int = 6000,
+    batch_size: int = 256,
     reinit: bool = True,
 ) -> dict[str, float]:
-    """Fit normalizer and train (pi_h, pi_l) on aggregated (D_h, D_l)."""
+    """Fit state/action normalizers and train (pi_h, pi_l) on aggregated (D_h, D_l)."""
     all_states = torch.cat([dh["states"], dl["states"]], dim=0)
-    agent.normalizer.fit(all_states)
+    agent.normalizer.fit(all_states, dl["chunks"])
     if reinit:
         agent.reset_models()
+
+    sched_h = torch.optim.lr_scheduler.CosineAnnealingLR(
+        agent.opt_h, T_max=max(steps_h, 1), eta_min=1e-5
+    )
+    sched_l = torch.optim.lr_scheduler.CosineAnnealingLR(
+        agent.opt_l, T_max=max(steps_l, 1), eta_min=1e-5
+    )
 
     # Pre-encode unique instructions once for fast pi_h minibatches.
     uniq_instrs = sorted(set(dh["instructions"]))
@@ -56,6 +63,7 @@ def train_on_datasets(
             dh["prev_idxs"][idx],
             dh["target_idxs"][idx],
         )
+        sched_h.step()
 
     nl = len(dl["z_idxs"])
     loss_l = 0.0
@@ -64,6 +72,7 @@ def train_on_datasets(
         loss_l = agent.update_low(
             dl["states"][idx], dl["z_idxs"][idx], dl["chunks"][idx]
         )
+        sched_l.step()
 
     return {"loss_h": loss_h, "loss_l": loss_l}
 
@@ -191,9 +200,9 @@ def main():
     p.add_argument("--variant", choices=["semantic", "exec"], default="semantic")
     p.add_argument("--demos", default=None)
     p.add_argument("--out_dir", default=None)
-    p.add_argument("--steps_h", type=int, default=1500)
-    p.add_argument("--steps_l", type=int, default=3000)
-    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--steps_h", type=int, default=2000)
+    p.add_argument("--steps_l", type=int, default=6000)
+    p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--exec_steps", type=int, default=4)
     p.add_argument("--diffusion_steps", type=int, default=20)
     p.add_argument("--calib_episodes", type=int, default=20)

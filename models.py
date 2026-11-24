@@ -7,7 +7,6 @@ import hashlib
 import math
 import os
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -93,28 +92,57 @@ class TextEncoder:
         return torch.stack([self._cache[t] for t in texts], dim=0).to(self.device)
 
 
-class StateNormalizer:
-    """Standard-score state normalizer serializable as plain tensors."""
+class StateActionNormalizer:
+    """Z-score state normalizer + per-dim [-1, 1] min-max action normalizer."""
 
-    def __init__(self, mean: torch.Tensor | None = None, std: torch.Tensor | None = None):
-        self.mean = mean
-        self.std = std
+    def __init__(self):
+        self.mean: torch.Tensor | None = None
+        self.std: torch.Tensor | None = None
+        self.act_min: torch.Tensor | None = None
+        self.act_max: torch.Tensor | None = None
 
-    def fit(self, states: torch.Tensor):
+    def fit(self, states: torch.Tensor, actions: torch.Tensor | None = None):
         self.mean = states.mean(dim=0)
         self.std = states.std(dim=0).clamp(min=1e-4)
+        if actions is not None:
+            flat_a = actions.reshape(-1, actions.shape[-1])
+            self.act_min = flat_a.amin(dim=0) - 1e-4
+            self.act_max = flat_a.amax(dim=0) + 1e-4
 
     def normalize(self, s: torch.Tensor) -> torch.Tensor:
         if self.mean is None or self.std is None:
             return s
         return (s - self.mean.to(s.device)) / self.std.to(s.device)
 
+    def normalize_action(self, a: torch.Tensor) -> torch.Tensor:
+        if self.act_min is None or self.act_max is None:
+            return a.clamp(-1.0, 1.0)
+        lo = self.act_min.to(a.device)
+        hi = self.act_max.to(a.device)
+        scale = (hi - lo).clamp(min=1e-4)
+        return (2.0 * (a - lo) / scale - 1.0).clamp(-1.0, 1.0)
+
+    def unnormalize_action(self, a_norm: torch.Tensor) -> torch.Tensor:
+        a_clamped = a_norm.clamp(-1.0, 1.0)
+        if self.act_min is None or self.act_max is None:
+            return a_clamped
+        lo = self.act_min.to(a_clamped.device)
+        hi = self.act_max.to(a_clamped.device)
+        return 0.5 * (a_clamped + 1.0) * (hi - lo) + lo
+
     def state_dict(self) -> dict[str, torch.Tensor]:
-        return {"mean": self.mean.cpu(), "std": self.std.cpu()}
+        out = {"mean": self.mean.cpu(), "std": self.std.cpu()}
+        if self.act_min is not None and self.act_max is not None:
+            out["act_min"] = self.act_min.cpu()
+            out["act_max"] = self.act_max.cpu()
+        return out
 
     def load_state_dict(self, d: dict[str, torch.Tensor]):
         self.mean = d["mean"].float()
         self.std = d["std"].float()
+        if "act_min" in d and "act_max" in d:
+            self.act_min = d["act_min"].float()
+            self.act_max = d["act_max"].float()
 
 
 class HighLevelTransformer(nn.Module):
@@ -132,7 +160,6 @@ class HighLevelTransformer(nn.Module):
         super().__init__()
         self.state_proj = nn.Linear(state_dim, d_model)
         self.instr_proj = nn.Linear(text_dim, d_model)
-        # +1 index reserved for NONE_SUBGOAL at episode start.
         self.prev_emb = nn.Embedding(num_subgoals + 1, d_model)
         self.role_emb = nn.Parameter(torch.randn(1, 3, d_model) * 0.02)
         enc_layer = nn.TransformerEncoderLayer(
@@ -171,7 +198,7 @@ class FiLMResidualBlock(nn.Module):
         gamma, beta = self.film(cond).chunk(2, dim=-1)
         h = self.norm(x) * (1.0 + gamma) + beta
         h = F.mish(self.fc1(h))
-        return x + self.fc2(h)
+        return x + F.mish(self.fc2(h))
 
 
 class FiLMDiffusionNet(nn.Module):
@@ -183,8 +210,8 @@ class FiLMDiffusionNet(nn.Module):
         text_dim: int,
         action_dim: int = 4,
         horizon: int = 8,
-        hidden_dim: int = 256,
-        num_blocks: int = 3,
+        hidden_dim: int = 384,
+        num_blocks: int = 4,
     ):
         super().__init__()
         self.horizon = horizon
@@ -196,12 +223,16 @@ class FiLMDiffusionNet(nn.Module):
             nn.Linear(hidden_dim // 2, hidden_dim // 2),
         )
         self.state_mlp = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim // 2), nn.Mish()
+            nn.Linear(state_dim, hidden_dim),
+            nn.Mish(),
+            nn.Linear(hidden_dim, hidden_dim),
         )
         self.subgoal_mlp = nn.Sequential(
-            nn.Linear(text_dim, hidden_dim // 2), nn.Mish()
+            nn.Linear(text_dim, hidden_dim // 2),
+            nn.Mish(),
+            nn.Linear(hidden_dim // 2, hidden_dim // 2),
         )
-        cond_dim = (hidden_dim // 2) * 3
+        cond_dim = hidden_dim * 2
         self.in_proj = nn.Linear(flat_dim, hidden_dim)
         self.blocks = nn.ModuleList(
             [FiLMResidualBlock(hidden_dim, cond_dim) for _ in range(num_blocks)]
@@ -270,18 +301,10 @@ class HierarchicalAgent:
         self.text_encoder = TextEncoder(
             cache_path=cache_path, mode=text_mode, device=device
         )
-        self.normalizer = StateNormalizer()
-        self.pi_h = HighLevelTransformer(
-            state_dim, self.text_encoder.emb_dim, len(self.vocab)
-        ).to(device)
-        self.pi_l = FiLMDiffusionNet(
-            state_dim, self.text_encoder.emb_dim, action_dim, horizon
-        ).to(device)
-        self.pi_l_ema = deepcopy(self.pi_l).eval().requires_grad_(False)
+        self.normalizer = StateActionNormalizer()
         self.ema_rate = 0.995
-
-        self.opt_h = torch.optim.AdamW(self.pi_h.parameters(), lr=lr, weight_decay=1e-4)
-        self.opt_l = torch.optim.AdamW(self.pi_l.parameters(), lr=lr, weight_decay=1e-4)
+        self._ema_step = 0
+        self.reset_models()
 
         betas = cosine_beta_schedule(diffusion_steps).to(device)
         self.betas = betas
@@ -298,6 +321,7 @@ class HierarchicalAgent:
             self.state_dim, self.text_encoder.emb_dim, self.action_dim, self.horizon
         ).to(self.device)
         self.pi_l_ema = deepcopy(self.pi_l).eval().requires_grad_(False)
+        self._ema_step = 0
         self.opt_h = torch.optim.AdamW(
             self.pi_h.parameters(), lr=self.lr, weight_decay=1e-4
         )
@@ -336,7 +360,7 @@ class HierarchicalAgent:
         self.pi_l.train()
         s_norm = self.normalizer.normalize(states.to(self.device))
         z_emb = self.vocab_embs[z_idxs.to(self.device)]
-        x0 = action_chunks.to(self.device).clamp(-1.0, 1.0)
+        x0 = self.normalizer.normalize_action(action_chunks.to(self.device))
         b = x0.shape[0]
         t = torch.randint(0, self.diffusion_steps, (b,), device=self.device)
         eps = torch.randn_like(x0)
@@ -348,9 +372,12 @@ class HierarchicalAgent:
         loss.backward()
         nn.utils.clip_grad_norm_(self.pi_l.parameters(), 1.0)
         self.opt_l.step()
+
+        self._ema_step += 1
+        decay = min(self.ema_rate, (1.0 + self._ema_step) / (10.0 + self._ema_step))
         with torch.no_grad():
             for p, p_ema in zip(self.pi_l.parameters(), self.pi_l_ema.parameters()):
-                p_ema.data.mul_(self.ema_rate).add_(p.data, alpha=1.0 - self.ema_rate)
+                p_ema.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
         return float(loss.item())
 
     @torch.no_grad()
@@ -373,22 +400,34 @@ class HierarchicalAgent:
 
     @torch.no_grad()
     def sample_chunk(self, state_1d: torch.Tensor, subgoal: str) -> torch.Tensor:
+        """Sample an action chunk via clipped-x0 DDPM posterior (never clamping noisy x_t)."""
         self.pi_l_ema.eval()
         s_norm = self.normalizer.normalize(state_1d.unsqueeze(0).to(self.device))
         z_emb = self.vocab_embs[self.subgoal_to_idx[subgoal]].unsqueeze(0)
         xt = torch.randn((1, self.horizon, self.action_dim), device=self.device)
+
         for step in range(self.diffusion_steps - 1, -1, -1):
             t_b = torch.tensor([step], dtype=torch.long, device=self.device)
             eps = self.pi_l_ema(xt, t_b, s_norm, z_emb)
             alpha = self.alphas[step]
             ab = self.alphas_bar[step]
-            mean = (xt - ((1.0 - alpha) / (1.0 - ab).sqrt()) * eps) / alpha.sqrt()
+            ab_prev = (
+                self.alphas_bar[step - 1]
+                if step > 0
+                else torch.tensor(1.0, device=self.device)
+            )
+            beta = self.betas[step]
+
+            x0_pred = ((xt - (1.0 - ab).sqrt() * eps) / ab.sqrt()).clamp(-1.0, 1.0)
             if step > 0:
-                xt = mean + self.betas[step].sqrt() * torch.randn_like(xt)
+                coef_x0 = ab_prev.sqrt() * beta / (1.0 - ab)
+                coef_xt = alpha.sqrt() * (1.0 - ab_prev) / (1.0 - ab)
+                post_var = beta * (1.0 - ab_prev) / (1.0 - ab)
+                xt = coef_x0 * x0_pred + coef_xt * xt + post_var.sqrt() * torch.randn_like(xt)
             else:
-                xt = mean
-            xt = xt.clamp(-1.0, 1.0)
-        return xt[0]
+                xt = x0_pred
+
+        return self.normalizer.unnormalize_action(xt[0])
 
     @torch.no_grad()
     def diffusion_loss_score(
@@ -398,7 +437,7 @@ class HierarchicalAgent:
         generated_chunk: torch.Tensor,
         n_mc: int = 8,
     ) -> float:
-        """Diff-DAgger OOD uncertainty score u_l(s) on generated action chunk."""
+        """Diff-DAgger OOD uncertainty score u_l(s) on normalized generated chunk."""
         self.pi_l_ema.eval()
         s_norm = self.normalizer.normalize(
             state_1d.unsqueeze(0).to(self.device)
@@ -408,8 +447,11 @@ class HierarchicalAgent:
             .unsqueeze(0)
             .expand(n_mc, -1)
         )
-        x0 = generated_chunk.unsqueeze(0).to(self.device).expand(n_mc, -1, -1)
-        # Stratified diffusion timesteps + fixed-seed noise for low-variance scoring.
+        x0 = (
+            self.normalizer.normalize_action(generated_chunk.to(self.device))
+            .unsqueeze(0)
+            .expand(n_mc, -1, -1)
+        )
         t = torch.linspace(
             1, self.diffusion_steps - 1, n_mc, device=self.device
         ).long()

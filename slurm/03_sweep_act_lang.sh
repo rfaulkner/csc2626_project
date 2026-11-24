@@ -4,7 +4,7 @@
 #SBATCH --output=slurm/output/%A_%a_%x.out
 #SBATCH --error=slurm/output/%A_%a_%x.err
 #SBATCH --array=0-19
-#SBATCH --time=03:30:00
+#SBATCH --time=04:30:00
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --ntasks-per-node=1
@@ -12,12 +12,7 @@
 #SBATCH --mem=32G
 
 # Week 4: Main ACT vs LANG experiment matrix (2 tasks x 2 variants x 5 seeds = 20 jobs).
-# Per (task, variant, seed), runs:
-#   1. Matched supervision-cost budget (COST_BUDGET=100):
-#      - lambda-invariant channels once (bc, lang, random_lang)
-#      - lambda sweep (0.0, 0.05, 0.1, 0.2) for act, act_label, random_act
-#   2. Matched per-query budget (QUERY_BUDGET=25 at lambda=0.0):
-#      - bc, lang, act, act_label, random_lang, random_act
+# Runs up to PARALLEL=3 conditions concurrently across the 4 CPU cores + shared L40S GPU.
 
 set -euo pipefail
 
@@ -27,6 +22,8 @@ mkdir -p slurm/output results
 
 export HF_HOME="${HF_HOME:-/scratch/${USER}/hf_cache}"
 export HF_HUB_OFFLINE=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 
 # shellcheck disable=SC1091
@@ -38,6 +35,7 @@ readonly SEEDS=(0 1 2 3 4)
 readonly LAMS="${LAMS:-0.0 0.05 0.1 0.2}"
 readonly COST_BUDGET="${COST_BUDGET:-100}"
 readonly QUERY_BUDGET="${QUERY_BUDGET:-25}"
+readonly PARALLEL="${PARALLEL:-3}"
 
 idx="${SLURM_ARRAY_TASK_ID:-0}"
 seed="${SEEDS[$((idx % 5))]}"
@@ -59,19 +57,32 @@ run_cond() {
     --skip_existing
 }
 
-# 1. Matched cost budget across lambda sweep (plot_results.py broadcasts lam=0 baselines).
-for ch in bc lang random_lang; do
-  run_cond "${ch}" "${COST_BUDGET}" 0.0
+# Warm shared Round-0 BC evaluation cache once via the instant `bc` condition.
+run_cond bc "${COST_BUDGET}" 0.0
+
+queue_cond() {
+  while (( $(jobs -rp | wc -l) >= PARALLEL )); do
+    wait -n
+  done
+  run_cond "$@" &
+}
+
+# 1. Matched cost budget across lambda sweep.
+for ch in lang random_lang; do
+  queue_cond "${ch}" "${COST_BUDGET}" 0.0
 done
 for lam in ${LAMS}; do
   for ch in act act_label random_act; do
-    run_cond "${ch}" "${COST_BUDGET}" "${lam}"
+    queue_cond "${ch}" "${COST_BUDGET}" "${lam}"
   done
 done
 
 # 2. Matched query-count budget (lam=0.0).
 if [[ "${QUERY_BUDGET}" != "0" && "${QUERY_BUDGET}" != "${COST_BUDGET}" ]]; then
-  for ch in bc lang act act_label random_lang random_act; do
-    run_cond "${ch}" "${QUERY_BUDGET}" 0.0
+  run_cond bc "${QUERY_BUDGET}" 0.0
+  for ch in lang act act_label random_lang random_act; do
+    queue_cond "${ch}" "${QUERY_BUDGET}" 0.0
   done
 fi
+
+wait

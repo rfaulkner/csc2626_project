@@ -42,13 +42,13 @@ def collect_demonstrations(
     z_to_idx = {z: i for i, z in enumerate(vocab)}
     none_idx = len(vocab)
     expert = ScriptedPickPlaceExpert()
-    max_steps = env.spec.max_episode_steps or 180
+    max_steps = env.spec.max_episode_steps or 220
 
     dh_states, dh_instrs, dh_prev, dh_target = [], [], [], []
     dl_states, dl_z, dl_chunks = [], [], []
 
     attempts, collected, ep_lengths = 0, 0, []
-    while collected < num_demos and attempts < num_demos * 4:
+    while collected < num_demos and attempts < num_demos * 8:
         obs, _ = env.reset(seed=seed + attempts)
         attempts += 1
         expert.reset()

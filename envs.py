@@ -18,7 +18,6 @@ from mani_skill.agents.robots import Panda
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.envs.utils import randomization
 from mani_skill.utils import common
-from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs.pose import Pose
@@ -69,8 +68,8 @@ class _MultiCubeBaseEnv(BaseEnv):
         self.is_exec = variant == "exec"
         self.half_size_val = 0.016 if self.is_exec else 0.020
         self.qpos_noise = 0.05 if self.is_exec else 0.015
-        self.push_prob = 0.04 if self.is_exec else 0.0
-        self.push_vel = 0.075
+        self.push_prob = 0.03 if self.is_exec else 0.0
+        self.push_vel = 0.055
         self.instruction: str = ""
         self.plan: list[str] = []
         self._push_rng = np.random.RandomState(0)
@@ -78,6 +77,17 @@ class _MultiCubeBaseEnv(BaseEnv):
 
     def _load_agent(self, options: dict):
         super()._load_agent(options, sapien.Pose(p=[-0.615, 0, 0]))
+
+    def _make_cube(self, half_size: float, color: list[float], name: str, pose: sapien.Pose):
+        builder = self.scene.create_actor_builder()
+        builder.add_box_collision(half_size=[half_size] * 3)
+        if self.scene.can_render():
+            builder.add_box_visual(
+                half_size=[half_size] * 3,
+                material=sapien.render.RenderMaterial(base_color=color),
+            )
+        builder.set_initial_pose(pose)
+        return builder.build(name=name)
 
     def _build_cubes(self):
         self.cube_half_size = common.to_tensor(
@@ -88,12 +98,11 @@ class _MultiCubeBaseEnv(BaseEnv):
         )
         self.table_scene.build()
         self.cubes = {
-            c: actors.build_cube(
-                self.scene,
+            c: self._make_cube(
                 half_size=self.half_size_val,
                 color=RGBA[c],
                 name=f"cube_{c}",
-                initial_pose=sapien.Pose(p=[0.5 + 0.1 * i, 0, 0.1]),
+                pose=sapien.Pose(p=[0.5 + 0.1 * i, 0, 0.1]),
             )
             for i, c in enumerate(COLORS)
         }
@@ -134,12 +143,22 @@ class _MultiCubeBaseEnv(BaseEnv):
             return
         if self._push_rng.rand() >= self.push_prob:
             return
-        candidates = [
-            c
-            for c in COLORS[:3]
-            if not bool(self.agent.is_grasping(self.cubes[c])[0].item())
-            and self.cubes[c].pose.p[0, 2].item() < 0.15
-        ]
+        poses = {c: self.cubes[c].pose.p[0] for c in COLORS[:3]}
+        candidates = []
+        for c, p in poses.items():
+            if bool(self.agent.is_grasping(self.cubes[c])[0].item()):
+                continue
+            if p[2].item() > self.half_size_val + 0.006:
+                continue
+            has_upper = any(
+                other != c
+                and poses[other][2].item() > self.half_size_val * 2.2
+                and float(torch.linalg.norm(poses[other][:2] - p[:2]).item())
+                < self.half_size_val * 2.5
+                for other in poses
+            )
+            if not has_upper:
+                candidates.append(c)
         if not candidates:
             return
         target = self.cubes[candidates[self._push_rng.randint(len(candidates))]]
@@ -328,16 +347,15 @@ class ColorSortEnv(_MultiCubeBaseEnv):
         del options
         self._build_cubes()
         self.bins = {}
-        for b_col, (bx, by) in self.BIN_POS.items():
-            self.bins[b_col] = actors.build_box(
-                self.scene,
-                half_sizes=[0.042, 0.042, 0.002],
-                color=BIN_RGBA[b_col],
-                name=f"bin_{b_col}",
-                body_type="kinematic",
-                add_collision=False,
-                initial_pose=sapien.Pose(p=[bx, by, 0.002]),
-            )
+        if self.scene.can_render():
+            for b_col, (bx, by) in self.BIN_POS.items():
+                builder = self.scene.create_actor_builder()
+                builder.add_box_visual(
+                    half_size=[0.042, 0.042, 0.002],
+                    material=sapien.render.RenderMaterial(base_color=BIN_RGBA[b_col]),
+                )
+                builder.set_initial_pose(sapien.Pose(p=[bx, by, 0.002]))
+                self.bins[b_col] = builder.build_kinematic(name=f"bin_{b_col}")
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         del options
@@ -345,7 +363,8 @@ class ColorSortEnv(_MultiCubeBaseEnv):
             b = len(env_idx)
             self.table_scene.initialize(env_idx)
             for b_col, (bx, by) in self.BIN_POS.items():
-                self.bins[b_col].set_pose(sapien.Pose(p=[bx, by, 0.002]))
+                if b_col in self.bins:
+                    self.bins[b_col].set_pose(sapien.Pose(p=[bx, by, 0.002]))
             ep_seed = int(self._episode_seed[0])
             self._push_rng.seed(ep_seed + 31)
             rng = np.random.RandomState(ep_seed)
@@ -428,6 +447,7 @@ def make_env(
     task: str,
     variant: str = "semantic",
     sim_backend: str = "physx_cpu",
+    render_backend: str = "none",
 ) -> BaseEnv:
     """Instantiate a single-arm Panda environment in state/delta-EE mode."""
     env_id = TASK_IDS.get(task, task)
@@ -437,5 +457,6 @@ def make_env(
         obs_mode="state",
         control_mode="pd_ee_delta_pos",
         sim_backend=sim_backend,
+        render_backend=render_backend,
         variant=variant,
     )

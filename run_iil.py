@@ -233,10 +233,10 @@ def main():
         help="Random gate firing prob; <0 uses calibrated gate.fire_rate.",
     )
     p.add_argument("--oracle_noise", type=float, default=0.0)
-    p.add_argument("--steps_h", type=int, default=1500)
-    p.add_argument("--steps_l", type=int, default=3000)
-    p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--cf_samples_per_round", type=int, default=15)
+    p.add_argument("--steps_h", type=int, default=2000)
+    p.add_argument("--steps_l", type=int, default=6000)
+    p.add_argument("--batch_size", type=int, default=256)
+    p.add_argument("--cf_samples_per_round", type=int, default=8)
     p.add_argument("--skip_existing", action="store_true")
     p.add_argument("--demos", default=None)
     p.add_argument("--bc_dir", default=None)
@@ -302,7 +302,18 @@ def main():
 
     cum_cost = 0.0
     total_queries = 0
-    eval0 = evaluate_policy(env, agent, n_episodes=args.eval_episodes, seed_offset=20000)
+    eval0_cache = os.path.join(bc_dir, f"eval0_n{args.eval_episodes}.json")
+    if os.path.exists(eval0_cache):
+        with open(eval0_cache, "r", encoding="utf-8") as f:
+            eval0 = json.load(f)
+    else:
+        eval0 = evaluate_policy(
+            env, agent, n_episodes=args.eval_episodes, seed_offset=20000
+        )
+        tmp_cache = f"{eval0_cache}.{os.getpid()}"
+        with open(tmp_cache, "w", encoding="utf-8") as f:
+            json.dump(eval0, f)
+        os.replace(tmp_cache, eval0_cache)
     rows = [
         {
             "task": args.task,
@@ -357,8 +368,13 @@ def main():
                 steps_l=args.steps_l,
                 batch_size=args.batch_size,
             )
+            n_eval = (
+                args.eval_episodes
+                if r == args.rounds
+                else min(args.eval_episodes, 50)
+            )
             eval_r = evaluate_policy(
-                env, agent, n_episodes=args.eval_episodes, seed_offset=20000
+                env, agent, n_episodes=n_eval, seed_offset=20000
             )
 
         row = {

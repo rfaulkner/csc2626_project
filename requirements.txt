@@ -1,8 +1,8 @@
-numpy>=1.24
+numpy>=1.24,<2
 scipy
 matplotlib
 torch
-transformers
+transformers<5
 huggingface_hub
 gymnasium>=0.29.1
 sapien==3.0.3
@@ -18,7 +18,7 @@ tqdm
 requests
 defusedxml
 imageio
-opencv-python-headless
+opencv-python-headless<4.12
 GitPython
 tabulate
 tyro>=0.8.5
