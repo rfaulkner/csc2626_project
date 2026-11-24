@@ -182,10 +182,7 @@ class _MultiCubeBaseEnv(BaseEnv):
         return extra
 
     def is_picked(self, color: str) -> bool:
-        cube = self.cubes[color]
-        grasped = bool(self.agent.is_grasping(cube)[0].item())
-        lifted = cube.pose.p[0, 2].item() > self.half_size_val + 0.03
-        return grasped and lifted
+        return bool(self.agent.is_grasping(self.cubes[color])[0].item())
 
     def grasped_color(self) -> str | None:
         for c in COLORS:

@@ -11,7 +11,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from envs import NONE_SUBGOAL
+from envs import BIN_COLORS, COLORS, NONE_SUBGOAL
+
+INSTR_TOKENS: tuple[str, ...] = (
+    "stack",
+    "put",
+    "pick",
+    "on",
+    "in",
+    "bin",
+    "cube",
+    "then",
+    *COLORS,
+)
+_TOK_TO_IDX = {w: i for i, w in enumerate(INSTR_TOKENS)}
 
 
 def cosine_beta_schedule(steps: int, s: float = 0.008) -> torch.Tensor:
@@ -19,7 +32,38 @@ def cosine_beta_schedule(steps: int, s: float = 0.008) -> torch.Tensor:
     alphas_bar = torch.cos((t + s) / (1.0 + s) * (math.pi / 2.0)) ** 2
     alphas_bar = alphas_bar / alphas_bar[0]
     betas = 1.0 - (alphas_bar[1:] / alphas_bar[:-1])
-    return betas.clamp(1e-4, 0.999).float()
+    return betas.clamp(1e-4, 0.85).float()
+
+
+def encode_subgoal_tokens(vocab: list[str]) -> torch.Tensor:
+    """Compositional token indicators [op(3), src_color(4), dst_color_or_bin(4)]."""
+    feats = torch.zeros(len(vocab), 11, dtype=torch.float32)
+    for i, z in enumerate(vocab):
+        parts = z.split()
+        if parts[0] == "pick":
+            feats[i, 0] = 1.0
+            feats[i, 3 + COLORS.index(parts[1])] = 1.0
+        elif parts[0] == "stack":
+            feats[i, 1] = 1.0
+            feats[i, 3 + COLORS.index(parts[1])] = 1.0
+            feats[i, 7 + COLORS.index(parts[3])] = 1.0
+        elif parts[0] == "put":
+            feats[i, 2] = 1.0
+            feats[i, 3 + COLORS.index(parts[1])] = 1.0
+            feats[i, 7 + BIN_COLORS.index(parts[3])] = 1.0
+    return feats
+
+
+def encode_instruction_tokens(texts: list[str], max_words: int = 12) -> torch.Tensor:
+    """Ordered word-level one-hot tensor (B, max_words * |INSTR_TOKENS|) for g."""
+    v = len(INSTR_TOKENS)
+    out = torch.zeros(len(texts), max_words, v, dtype=torch.float32)
+    for b, txt in enumerate(texts):
+        words = txt.replace(",", " ").split()[:max_words]
+        for pos, w in enumerate(words):
+            if w in _TOK_TO_IDX:
+                out[b, pos, _TOK_TO_IDX[w]] = 1.0
+    return out.reshape(len(texts), max_words * v)
 
 
 class TextEncoder:
@@ -151,7 +195,7 @@ class HighLevelTransformer(nn.Module):
     def __init__(
         self,
         state_dim: int,
-        text_dim: int,
+        instr_dim: int,
         num_subgoals: int,
         d_model: int = 128,
         nhead: int = 4,
@@ -159,7 +203,7 @@ class HighLevelTransformer(nn.Module):
     ):
         super().__init__()
         self.state_proj = nn.Linear(state_dim, d_model)
-        self.instr_proj = nn.Linear(text_dim, d_model)
+        self.instr_proj = nn.Linear(instr_dim, d_model)
         self.prev_emb = nn.Embedding(num_subgoals + 1, d_model)
         self.role_emb = nn.Parameter(torch.randn(1, 3, d_model) * 0.02)
         enc_layer = nn.TransformerEncoderLayer(
@@ -202,40 +246,55 @@ class FiLMResidualBlock(nn.Module):
 
 
 class FiLMDiffusionNet(nn.Module):
-    """Noise-prediction network eps_theta(a_t, t | s, CLIP(z)) over action chunks."""
+    """v-prediction FiLM Diffusion Policy with subgoal-gated isometric object slots."""
 
     def __init__(
         self,
         state_dim: int,
-        text_dim: int,
+        subgoal_dim: int,
         action_dim: int = 4,
         horizon: int = 8,
-        hidden_dim: int = 384,
-        num_blocks: int = 4,
+        hidden_dim: int = 256,
+        num_blocks: int = 3,
     ):
         super().__init__()
         self.horizon = horizon
         self.action_dim = action_dim
+        self.has_obj_slots = state_dim == 65
         flat_dim = horizon * action_dim
-        self.time_mlp = nn.Sequential(
-            nn.Linear(64, hidden_dim // 2),
-            nn.Mish(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 2),
-        )
-        self.state_mlp = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
+
+        self.z_mlp = nn.Sequential(
+            nn.Linear(subgoal_dim, hidden_dim),
             nn.Mish(),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        self.subgoal_mlp = nn.Sequential(
-            nn.Linear(text_dim, hidden_dim // 2),
+        if self.has_obj_slots:
+            # 4 physical cube slots + 1 subgoal-conditioned virtual goal anchor (bins/lift).
+            self.goal_anchor = nn.Linear(hidden_dim, 3)
+            self.slot_gate = nn.Linear(hidden_dim, 2 * 5)
+            geom_dim = 24
+        else:
+            geom_dim = state_dim
+
+        self.state_mlp = nn.Sequential(
+            nn.Linear(geom_dim, hidden_dim),
             nn.Mish(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 2),
+            nn.Linear(hidden_dim, hidden_dim),
         )
-        cond_dim = hidden_dim * 2
+        self.state_film = nn.Linear(hidden_dim, hidden_dim * 2)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(64, hidden_dim // 2),
+            nn.Mish(),
+            nn.Linear(hidden_dim // 2, hidden_dim),
+        )
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.Mish(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
         self.in_proj = nn.Linear(flat_dim, hidden_dim)
         self.blocks = nn.ModuleList(
-            [FiLMResidualBlock(hidden_dim, cond_dim) for _ in range(num_blocks)]
+            [FiLMResidualBlock(hidden_dim, hidden_dim) for _ in range(num_blocks)]
         )
         self.out_proj = nn.Sequential(
             nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, flat_dim)
@@ -249,22 +308,65 @@ class FiLMDiffusionNet(nn.Module):
         args = t.float().unsqueeze(-1) * freqs.unsqueeze(0)
         return torch.cat([args.sin(), args.cos()], dim=-1)
 
+    def _encode_state(self, s_raw: torch.Tensor, zh: torch.Tensor) -> torch.Tensor:
+        if not self.has_obj_slots:
+            g, bt = self.state_film(zh).chunk(2, dim=-1)
+            return F.mish(self.state_mlp(s_raw) * (1.0 + g) + bt)
+
+        b = s_raw.shape[0]
+        tcp = s_raw[:, 18:21]
+        cubes = s_raw[:, 25:65].reshape(b, 4, 10)
+        cube_pos = cubes[:, :, :3]
+        cube_rel = cubes[:, :, 7:10]
+
+        anchor_pos = self.goal_anchor(zh) * 0.20
+        anchor_rel = anchor_pos - tcp
+        slots_pos = torch.cat([cube_pos, anchor_pos.unsqueeze(1)], dim=1)
+        slots_rel = torch.cat([cube_rel, anchor_rel.unsqueeze(1)], dim=1)
+
+        w = F.softmax(self.slot_gate(zh).view(b, 2, 5), dim=-1)
+        sel_pos = torch.einsum("bko,bod->bkd", w, slots_pos)
+        sel_rel = torch.einsum("bko,bod->bkd", w, slots_rel)
+        src_p, dst_p = sel_pos[:, 0], sel_pos[:, 1]
+        src_rel, dst_rel = sel_rel[:, 0], sel_rel[:, 1]
+        diff = dst_p - src_p
+
+        d_src_xy = torch.linalg.norm(src_rel[:, :2], dim=-1, keepdim=True) * 10.0
+        d_src_z = src_rel[:, 2:3].abs() * 10.0
+        d_dst_xy = torch.linalg.norm(diff[:, :2], dim=-1, keepdim=True) * 10.0
+        d_dst_z = diff[:, 2:3] * 10.0
+        geom = torch.cat(
+            [
+                s_raw[:, 7:9] * 25.0,
+                tcp * 5.0,
+                src_p * 5.0,
+                src_rel * 5.0,
+                dst_p * 5.0,
+                dst_rel * 5.0,
+                diff * 5.0,
+                d_src_xy,
+                d_src_z,
+                d_dst_xy,
+                d_dst_z,
+            ],
+            dim=-1,
+        )
+        sh = self.state_mlp(geom)
+        g, bt = self.state_film(zh).chunk(2, dim=-1)
+        return F.mish(sh * (1.0 + g) + bt)
+
     def forward(
         self,
         noisy_chunk: torch.Tensor,
         t: torch.Tensor,
-        s_norm: torch.Tensor,
-        z_emb: torch.Tensor,
+        s_raw: torch.Tensor,
+        z_cond: torch.Tensor,
     ) -> torch.Tensor:
         b = noisy_chunk.shape[0]
-        cond = torch.cat(
-            [
-                self.state_mlp(s_norm),
-                self.subgoal_mlp(z_emb),
-                self.time_mlp(self._sinusoidal_t(t)),
-            ],
-            dim=-1,
-        )
+        zh = self.z_mlp(z_cond)
+        sf = self._encode_state(s_raw, zh)
+        th = self.time_mlp(self._sinusoidal_t(t))
+        cond = self.cond_mlp(torch.cat([sf, zh, th], dim=-1))
         h = self.in_proj(noisy_chunk.reshape(b, -1))
         for blk in self.blocks:
             h = blk(h, cond)
@@ -272,7 +374,7 @@ class FiLMDiffusionNet(nn.Module):
 
 
 class HierarchicalAgent:
-    """Two-level policy (pi_h, pi_l) with DDPM training, sampling, and Diff-DAgger score."""
+    """Two-level policy (pi_h, pi_l) with v-DDPM training, sampling, and Diff-DAgger score."""
 
     def __init__(
         self,
@@ -281,8 +383,8 @@ class HierarchicalAgent:
         action_dim: int = 4,
         horizon: int = 8,
         exec_steps: int = 4,
-        diffusion_steps: int = 20,
-        lr: float = 3e-4,
+        diffusion_steps: int = 16,
+        lr: float = 5e-4,
         text_mode: str = "clip",
         cache_path: str = "data/clip_cache.pt",
         device: str = "cpu",
@@ -301,6 +403,13 @@ class HierarchicalAgent:
         self.text_encoder = TextEncoder(
             cache_path=cache_path, mode=text_mode, device=device
         )
+        self.instr_tok_dim = 12 * len(INSTR_TOKENS)
+        self.instr_dim = self.text_encoder.emb_dim + self.instr_tok_dim
+        z_clip = self.text_encoder.encode(self.vocab)
+        z_tok = encode_subgoal_tokens(self.vocab).to(device)
+        self.vocab_embs = torch.cat([z_clip, z_tok], dim=-1)
+        self.subgoal_dim = self.vocab_embs.shape[-1]
+
         self.normalizer = StateActionNormalizer()
         self.ema_rate = 0.995
         self._ema_step = 0
@@ -310,15 +419,19 @@ class HierarchicalAgent:
         self.betas = betas
         self.alphas = 1.0 - betas
         self.alphas_bar = torch.cumprod(self.alphas, dim=0)
-        self.vocab_embs = self.text_encoder.encode(self.vocab)
+
+    def encode_instructions(self, texts: list[str]) -> torch.Tensor:
+        clip_e = self.text_encoder.encode(texts)
+        tok_e = encode_instruction_tokens(texts).to(self.device)
+        return torch.cat([clip_e, tok_e], dim=-1)
 
     def reset_models(self):
         """Reinitialize weights before retraining on aggregated DAgger datasets."""
         self.pi_h = HighLevelTransformer(
-            self.state_dim, self.text_encoder.emb_dim, len(self.vocab)
+            self.state_dim, self.instr_dim, len(self.vocab)
         ).to(self.device)
         self.pi_l = FiLMDiffusionNet(
-            self.state_dim, self.text_encoder.emb_dim, self.action_dim, self.horizon
+            self.state_dim, self.subgoal_dim, self.action_dim, self.horizon
         ).to(self.device)
         self.pi_l_ema = deepcopy(self.pi_l).eval().requires_grad_(False)
         self._ema_step = 0
@@ -358,7 +471,7 @@ class HierarchicalAgent:
         action_chunks: torch.Tensor,
     ) -> float:
         self.pi_l.train()
-        s_norm = self.normalizer.normalize(states.to(self.device))
+        s_raw = states.to(self.device)
         z_emb = self.vocab_embs[z_idxs.to(self.device)]
         x0 = self.normalizer.normalize_action(action_chunks.to(self.device))
         b = x0.shape[0]
@@ -366,8 +479,9 @@ class HierarchicalAgent:
         eps = torch.randn_like(x0)
         ab = self.alphas_bar[t].view(b, 1, 1)
         xt = ab.sqrt() * x0 + (1.0 - ab).sqrt() * eps
-        pred_eps = self.pi_l(xt, t, s_norm, z_emb)
-        loss = F.mse_loss(pred_eps, eps)
+        v_target = ab.sqrt() * eps - (1.0 - ab).sqrt() * x0
+        v_pred = self.pi_l(xt, t, s_raw, z_emb)
+        loss = F.mse_loss(v_pred, v_target)
         self.opt_l.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.pi_l.parameters(), 1.0)
@@ -386,7 +500,7 @@ class HierarchicalAgent:
     ) -> tuple[str, float]:
         self.pi_h.eval()
         s_norm = self.normalizer.normalize(state_1d.unsqueeze(0).to(self.device))
-        g_emb = self.text_encoder.encode([instruction])
+        g_emb = self.encode_instructions([instruction])
         prev_t = torch.tensor(
             [self.encode_prev_subgoal(prev_subgoal)],
             dtype=torch.long,
@@ -400,26 +514,21 @@ class HierarchicalAgent:
 
     @torch.no_grad()
     def sample_chunk(self, state_1d: torch.Tensor, subgoal: str) -> torch.Tensor:
-        """Sample an action chunk via clipped-x0 DDPM posterior (never clamping noisy x_t)."""
+        """Sample an action chunk via v-prediction DDPM posterior."""
         self.pi_l_ema.eval()
-        s_norm = self.normalizer.normalize(state_1d.unsqueeze(0).to(self.device))
+        s_raw = state_1d.unsqueeze(0).to(self.device)
         z_emb = self.vocab_embs[self.subgoal_to_idx[subgoal]].unsqueeze(0)
         xt = torch.randn((1, self.horizon, self.action_dim), device=self.device)
 
         for step in range(self.diffusion_steps - 1, -1, -1):
             t_b = torch.tensor([step], dtype=torch.long, device=self.device)
-            eps = self.pi_l_ema(xt, t_b, s_norm, z_emb)
-            alpha = self.alphas[step]
             ab = self.alphas_bar[step]
-            ab_prev = (
-                self.alphas_bar[step - 1]
-                if step > 0
-                else torch.tensor(1.0, device=self.device)
-            )
-            beta = self.betas[step]
-
-            x0_pred = ((xt - (1.0 - ab).sqrt() * eps) / ab.sqrt()).clamp(-1.0, 1.0)
+            v_pred = self.pi_l_ema(xt, t_b, s_raw, z_emb)
+            x0_pred = (ab.sqrt() * xt - (1.0 - ab).sqrt() * v_pred).clamp(-1.0, 1.0)
             if step > 0:
+                alpha = self.alphas[step]
+                ab_prev = self.alphas_bar[step - 1]
+                beta = self.betas[step]
                 coef_x0 = ab_prev.sqrt() * beta / (1.0 - ab)
                 coef_xt = alpha.sqrt() * (1.0 - ab_prev) / (1.0 - ab)
                 post_var = beta * (1.0 - ab_prev) / (1.0 - ab)
@@ -437,11 +546,9 @@ class HierarchicalAgent:
         generated_chunk: torch.Tensor,
         n_mc: int = 8,
     ) -> float:
-        """Diff-DAgger OOD uncertainty score u_l(s) on normalized generated chunk."""
+        """Diff-DAgger OOD uncertainty score u_l(s) via v-diffusion loss."""
         self.pi_l_ema.eval()
-        s_norm = self.normalizer.normalize(
-            state_1d.unsqueeze(0).to(self.device)
-        ).expand(n_mc, -1)
+        s_raw = state_1d.unsqueeze(0).to(self.device).expand(n_mc, -1)
         z_emb = (
             self.vocab_embs[self.subgoal_to_idx[subgoal]]
             .unsqueeze(0)
@@ -459,8 +566,9 @@ class HierarchicalAgent:
         eps = torch.randn(x0.shape, generator=gen, device=self.device)
         ab = self.alphas_bar[t].view(n_mc, 1, 1)
         xt = ab.sqrt() * x0 + (1.0 - ab).sqrt() * eps
-        pred = self.pi_l_ema(xt, t, s_norm, z_emb)
-        return float(F.mse_loss(pred, eps).item())
+        v_target = ab.sqrt() * eps - (1.0 - ab).sqrt() * x0
+        v_pred = self.pi_l_ema(xt, t, s_raw, z_emb)
+        return float(F.mse_loss(v_pred, v_target).item())
 
     def save(self, path: str):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

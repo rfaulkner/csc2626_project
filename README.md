@@ -25,7 +25,7 @@ source .venv/bin/activate
 | :--- | :--- |
 | `envs.py` | **W1–2**: `OrderedStack-v0` (`stack`) and `ColorSort-v0` (`sort`) in `semantic` (permuted order + distractors) and `exec` (smaller cubes, wider poses, random pushes) variants. |
 | `expert.py` | **W1**: `LanguageOracle` ($z_t^*$) and closed-loop `ScriptedPickPlaceExpert` with mid-episode release-and-regrasp recovery. |
-| `models.py` | **W2**: Frozen CLIP `TextEncoder`, `HighLevelTransformer` $\pi_h(z \mid s, g, z_{\text{prev}})$, and FiLM-conditioned state `LowLevelDiffusionPolicy` $\pi_l(a \mid s, z)$. |
+| `models.py` | **W2**: Frozen CLIP `TextEncoder`, `HighLevelTransformer` $\pi_h(z \mid s, g, z_{\text{prev}})$, and FiLM-conditioned state `FiLMDiffusionNet` $\pi_l(a \mid s, z)$. |
 | `gate.py` | **W3**: Shared gate $q(s) = \mathbb{I}[u_h(s) > \tau_h \lor u_l(s) > \tau_l]$ (entropy + Diff-DAgger diffusion loss) and held-out rollout calibration (including empirical firing rate). |
 | `collect_demos.py` | **W1–2**: Collects $N=50$ scripted demonstrations segmented into $D_h$ and $D_l$. |
 | `train_bc.py` | **W2–3**: Trains initial BC $(\pi_h, \pi_l)$, checks per-subgoal competence, and calibrates $(\tau_h, \tau_l)$. |

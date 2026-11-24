@@ -233,8 +233,8 @@ def main():
         help="Random gate firing prob; <0 uses calibrated gate.fire_rate.",
     )
     p.add_argument("--oracle_noise", type=float, default=0.0)
-    p.add_argument("--steps_h", type=int, default=2000)
-    p.add_argument("--steps_l", type=int, default=6000)
+    p.add_argument("--steps_h", type=int, default=1500)
+    p.add_argument("--steps_l", type=int, default=4000)
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--cf_samples_per_round", type=int, default=8)
     p.add_argument("--skip_existing", action="store_true")

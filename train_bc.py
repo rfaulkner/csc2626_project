@@ -47,7 +47,7 @@ def train_on_datasets(
 
     # Pre-encode unique instructions once for fast pi_h minibatches.
     uniq_instrs = sorted(set(dh["instructions"]))
-    instr_embs = agent.text_encoder.encode(uniq_instrs).cpu()
+    instr_embs = agent.encode_instructions(uniq_instrs).cpu()
     instr_map = {ins: i for i, ins in enumerate(uniq_instrs)}
     dh_g_idx = torch.tensor(
         [instr_map[ins] for ins in dh["instructions"]], dtype=torch.long
@@ -85,34 +85,38 @@ def evaluate_subgoal_competence(
 ) -> float:
     """Measure low-level pi_l per-subgoal completion rate given oracle z*."""
     u = env.unwrapped
-    max_steps = env.spec.max_episode_steps or 180
+    max_steps = env.spec.max_episode_steps or 220
     completed_subgoals, total_subgoals = 0, 0
 
     for ep in range(n_episodes):
         obs, _ = env.reset(seed=seed_offset + ep)
         plan = list(u.plan)
         total_subgoals += len(plan)
+        best_stage = 0
         steps = 0
         while steps < max_steps:
             z_star, _ = u.oracle_subgoal()
+            if z_star in plan:
+                best_stage = max(best_stage, plan.index(z_star))
             chunk = agent.sample_chunk(obs[0].float().cpu(), z_star)
             done = False
             for k in range(agent.exec_steps):
                 obs, _, term, trunc, info = env.step(chunk[k].cpu().numpy())
                 steps += 1
-                if bool(info["success"][0].item()) or bool(term[0]) or bool(trunc[0]) or steps >= max_steps:
+                while best_stage < len(plan) and u.is_subgoal_achieved(plan[best_stage]):
+                    best_stage += 1
+                if bool(info["success"][0].item()):
+                    best_stage = len(plan)
+                    done = True
+                    break
+                if bool(term[0]) or bool(trunc[0]) or steps >= max_steps:
                     done = True
                     break
                 if u.is_subgoal_achieved(z_star):
                     break
             if done:
                 break
-        # Count how many sequential stages in the plan finished.
-        if bool(u.evaluate()["success"][0].item()):
-            completed_subgoals += len(plan)
-        else:
-            z_rem, _ = u.oracle_subgoal()
-            completed_subgoals += plan.index(z_rem) if z_rem in plan else 0
+        completed_subgoals += best_stage
 
     return completed_subgoals / max(total_subgoals, 1)
 
@@ -200,11 +204,11 @@ def main():
     p.add_argument("--variant", choices=["semantic", "exec"], default="semantic")
     p.add_argument("--demos", default=None)
     p.add_argument("--out_dir", default=None)
-    p.add_argument("--steps_h", type=int, default=2000)
-    p.add_argument("--steps_l", type=int, default=6000)
+    p.add_argument("--steps_h", type=int, default=1500)
+    p.add_argument("--steps_l", type=int, default=4000)
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--exec_steps", type=int, default=4)
-    p.add_argument("--diffusion_steps", type=int, default=20)
+    p.add_argument("--diffusion_steps", type=int, default=16)
     p.add_argument("--calib_episodes", type=int, default=20)
     p.add_argument("--eval_episodes", type=int, default=50)
     p.add_argument("--quantile_h", type=float, default=0.85)
