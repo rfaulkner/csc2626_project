@@ -1,0 +1,7 @@
+task,variant,channel,lam,budget,seed,round,cum_cost,queries,query_precision,success,semantic_fail_rate,exec_fail_rate,dh_size,dl_size
+stack,semantic,random_act,0.1,100.0,4,0,0.0,0,nan,0.37,0.57,0.06,6405,6405
+stack,semantic,random_act,0.1,100.0,4,1,20.0,7,0.5714285714285714,0.32,0.62,0.06,6405,6535
+stack,semantic,random_act,0.1,100.0,4,2,39.4,12,0.8,0.5,0.5,0.0,6405,6679
+stack,semantic,random_act,0.1,100.0,4,3,59.4,18,0.16666666666666666,0.36,0.62,0.02,6405,6819
+stack,semantic,random_act,0.1,100.0,4,4,78.5,24,0.8333333333333334,0.32,0.56,0.12,6405,6950
+stack,semantic,random_act,0.1,100.0,4,5,98.5,29,0.4,0.35,0.56,0.09,6405,7100
